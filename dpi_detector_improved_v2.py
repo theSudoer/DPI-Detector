@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import ipaddress
 import json
 import socket
 import ssl
@@ -64,6 +65,16 @@ except Exception:
     scapy = None
     SCAPY_AVAILABLE = False
 
+# scapy's TLS layer (TLSClientHello, TLSServerHello, TLS, ...) isn't exposed
+# through scapy.all - it has to be imported explicitly, or the fallback JA3
+# path below silently falls through every time even though scapy is present.
+try:
+    import scapy.layers.tls.all as scapy_tls
+    SCAPY_TLS_AVAILABLE = True
+except Exception:
+    scapy_tls = None
+    SCAPY_TLS_AVAILABLE = False
+
 # aioquic for QUIC / HTTP/3 probing
 try:
     from aioquic.asyncio.client import connect as quic_connect
@@ -87,15 +98,13 @@ DEFAULT_SITES = [
     'www.wikipedia.org', 'www.cloudflare.com', 'www.microsoft.com', 'www.apple.com'
 ]
 
-TRUSTED_ISSUERS = [
-    'Google Trust Services', 'DigiCert', "Let's Encrypt", 'Amazon', 'GlobalSign',
-    'Sectigo', 'Entrust', 'GoDaddy', 'Cloudflare', 'Microsoft', 'IdenTrust'
-]
-
 DPI_INDICATORS = [
     'fortinet', 'fortigate', 'palo alto', 'cisco', 'zscaler', 'checkpoint',
     'sophos', 'mcafee', 'symantec', 'websense', 'bluecoat', 'barracuda', 'sonicwall'
 ]
+
+CDN_HOSTNAME_KEYWORDS = ('cloudflare', 'google', 'amazon', 'aws', 'akamai',
+                          'microsoft', 'apple', 'facebook', 'fastly')
 
 PUBLIC_RESOLVERS = ['8.8.8.8', '1.1.1.1', '9.9.9.9']
 DOH_ENDPOINTS = [
@@ -242,14 +251,11 @@ def tls_timing_profile(hostname: str, port: int = 443, samples: int = 7, timeout
         res.details['samples'] = len(timings)
         res.details['median_ms'] = round(med * 1000, 2) if med is not None else None
         res.details['iqr_ms'] = round(iqr * 1000, 2) if iqr is not None else None
-        if med and med > 0.45:
-            res.suspicious = True
-            res.score += 18
-            res.details.setdefault('flags', []).append('elevated_median')
-        if iqr is not None and iqr < 0.02 and med and med > 0.25:
-            res.suspicious = True
-            res.score += 25
-            res.details.setdefault('flags', []).append('low_iqr_high_med')
+        # No absolute scoring here: a fixed 450ms threshold flags anyone on a
+        # slow/mobile/high-latency link regardless of DPI. run_sites() scores
+        # this relative to the other sites tested in the same run instead,
+        # since a single connection's baseline latency isn't meaningful on
+        # its own.
     else:
         res.details['error'] = 'No successful handshakes'
         res.score += 5
@@ -331,11 +337,16 @@ def analyze_certificate(cert_dict: Dict, cert_der: Optional[bytes]) -> DetectorR
     cn = subject.get('commonName', '') or subject.get('cn', '') or ''
 
     issuer_str = f"{org} {cn}".lower()
-    matched_trusted = any(t.lower() in issuer_str for t in TRUSTED_ISSUERS)
-    if not matched_trusted:
+    # fetch_certificate() already validated the chain against the OS trust
+    # store (ssl.CERT_REQUIRED); '__unverified' is only set when that failed
+    # and we retried with verification disabled. Matching the issuer name
+    # against a short hardcoded CA list produced false positives for any
+    # legitimate CA not on the list (Buypass, SSL.com, ZeroSSL, national
+    # CAs, etc). A cert that verified is trusted regardless of who issued it.
+    if cert_dict.get('__unverified'):
         res.suspicious = True
-        res.score += 18
-        res.details.setdefault('flags', []).append('unknown_issuer')
+        res.score += 25
+        res.details.setdefault('flags', []).append('chain_verification_failed')
 
     for p in DPI_INDICATORS:
         if p in issuer_str:
@@ -386,6 +397,19 @@ def analyze_certificate(cert_dict: Dict, cert_der: Optional[bytes]) -> DetectorR
     return res
 
 # ---------- CT log check ----------
+def _ct_name_matches(hostname_lower: str, ct_hostnames: set) -> bool:
+    if hostname_lower in ct_hostnames:
+        return True
+    # CT logs commonly list a wildcard cert (*.example.com) that also covers
+    # www.example.com; an exact-string match against the CT sample missed
+    # this and flagged every wildcard-covered hostname as suspicious.
+    parts = hostname_lower.split('.', 1)
+    if len(parts) == 2:
+        wildcard = f'*.{parts[1]}'
+        if wildcard in ct_hostnames:
+            return True
+    return False
+
 def ct_log_check(hostname: str, observed_fingerprint_sha256: Optional[str]) -> DetectorResult:
     res = DetectorResult('ct_log')
     if not REQUESTS_AVAILABLE:
@@ -425,12 +449,12 @@ def ct_log_check(hostname: str, observed_fingerprint_sha256: Optional[str]) -> D
 
         hostname_lower = hostname.lower()
         if observed_fingerprint_sha256:
-            if hostname_lower not in hostnames:
+            if not _ct_name_matches(hostname_lower, hostnames):
                 res.suspicious = True
                 res.score += 12
                 res.details.setdefault('flags', []).append('hostname_not_in_ct_sample')
         else:
-            if hostname_lower not in hostnames:
+            if not _ct_name_matches(hostname_lower, hostnames):
                 res.score += 5
                 res.details.setdefault('flags', []).append('hostname_not_in_ct_sample_low_weight')
     except Exception as e:
@@ -519,9 +543,17 @@ def dns_spoof_check(hostname: str) -> DetectorResult:
 
     if pub_ips and sys_ips:
         if not any(ip in pub_ips for ip in sys_ips):
-            res.suspicious = True
-            res.score += 30
-            res.details.setdefault('flags', []).append('dns_mismatch')
+            # CDNs/anycast providers (Cloudflare, Akamai, Google, etc.) route
+            # different resolvers to different edge IPs by design, so a raw
+            # IP-set mismatch for these hostnames is expected, not a sign of
+            # DNS spoofing. Only score the mismatch for non-CDN hostnames.
+            if any(k in hostname.lower() for k in CDN_HOSTNAME_KEYWORDS):
+                res.details.setdefault('flags', []).append('dns_differs_but_cdn_hostname')
+                res.details['note'] = 'system/public resolvers disagree, expected for CDN hostnames'
+            else:
+                res.suspicious = True
+                res.score += 20
+                res.details.setdefault('flags', []).append('dns_mismatch')
 
     return res
 
@@ -609,6 +641,13 @@ def check_vpn() -> DetectorResult:
             try:
                 r = requests.get(svc, timeout=4)
                 ip = r.text.strip()
+                # A service returning an error page or rate-limit notice (still
+                # HTTP 200) would otherwise register as a distinct "IP" and
+                # falsely trigger external_ip_mismatch below.
+                try:
+                    ipaddress.ip_address(ip)
+                except ValueError:
+                    continue
                 if ip:
                     exts.append(ip)
             except Exception:
@@ -768,16 +807,16 @@ def ja3_ja3s_check(hostname: str, port: int = 443, timeout: int = 4) -> Detector
             res.details.setdefault('note', f'sniff_failed:{e}')
 
     # If JA3python isn't available or sniffing failed, fall back to prior scapy-based best-effort
-    if SCAPY_AVAILABLE:
+    if SCAPY_AVAILABLE and SCAPY_TLS_AVAILABLE:
         try:
             # Attempt to reuse previous best-effort approach (non-exact JA3 string build)
             CH_CIPHERS = [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0x009e, 0x009c]
             try:
                 ch = None
                 try:
-                    ch = scapy.TLSClientHello(ciphers=CH_CIPHERS,
-                                              ext=[scapy.TLSExt_SupportedGroups(groups=[29, 23, 24]),
-                                                   scapy.TLSExt_SupportedVersions(versions=[0x0304, 0x0303])])
+                    ch = scapy_tls.TLSClientHello(ciphers=CH_CIPHERS,
+                                              ext=[scapy_tls.TLSExt_SupportedGroups(groups=[29, 23, 24]),
+                                                   scapy_tls.TLSExt_SupportedVersions(versions=[0x0304, 0x0303])])
                 except Exception:
                     # If TLSClientHello not available, create basic TLS record object placeholder
                     ch = None
@@ -796,7 +835,7 @@ def ja3_ja3s_check(hostname: str, port: int = 443, timeout: int = 4) -> Detector
                 scapy.send(ip / ack, verbose=0)
                 if ch is not None:
                     try:
-                        tls_pkt = scapy.TLS(msg=[ch])
+                        tls_pkt = scapy_tls.TLS(msg=[ch])
                         ans = scapy.sr1(ip / ack / tls_pkt, timeout=2, verbose=0)
                     except Exception:
                         ans = None
@@ -831,8 +870,8 @@ def ja3_ja3s_check(hostname: str, port: int = 443, timeout: int = 4) -> Detector
                         pass
                     # Attempt to parse serverhello similarly (best-effort)
                     try:
-                        if ans and ans.haslayer(scapy.TLSServerHello):
-                            sh = ans[scapy.TLSServerHello]
+                        if ans and ans.haslayer(scapy_tls.TLSServerHello):
+                            sh = ans[scapy_tls.TLSServerHello]
                             sv = int(getattr(sh, 'version', 0))
                             scipher = int(getattr(sh, 'cipher', 0))
                             sext = []
@@ -861,6 +900,8 @@ def ja3_ja3s_check(hostname: str, port: int = 443, timeout: int = 4) -> Detector
                 res.details.setdefault('note', f'scapy_fallback_error:{e}')
         except Exception as e:
             res.details.setdefault('note', f'scapy_wrapper_error:{e}')
+    elif not SCAPY_TLS_AVAILABLE:
+        res.details.setdefault('error', 'scapy_layers_tls_not_importable')
     else:
         # Neither JA3python nor scapy available
         res.details.setdefault('error', 'ja3_not_available_scapy_not_available')
@@ -915,6 +956,14 @@ def detect_reset_injection(hostname: str, port: int = 443, timeout: int = 3) -> 
     return res
 
 # ---------- TTL manipulation check ----------
+def _reverse_dns(ip: str, timeout: float = 1.5) -> Optional[str]:
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(socket.gethostbyaddr, ip)
+            return fut.result(timeout=timeout)[0].lower()
+    except Exception:
+        return None
+
 def ttl_manipulation_check(hostname: str) -> DetectorResult:
     res = DetectorResult('ttl_manipulation')
     if not SCAPY_AVAILABLE:
@@ -932,10 +981,15 @@ def ttl_manipulation_check(hostname: str) -> DetectorResult:
                     src = None
                 if src:
                     hops.append(src)
-                    if any(ind in (src or '').lower() for ind in DPI_INDICATORS):
+                    # DPI_INDICATORS are vendor names (e.g. "fortinet"), which
+                    # never appear in a raw hop IP address - only in its rDNS
+                    # name, if any. Resolving PTR records is what makes this
+                    # check able to match anything at all.
+                    ptr = _reverse_dns(src)
+                    if ptr and any(ind in ptr for ind in DPI_INDICATORS):
                         res.suspicious = True
                         res.score += 28
-                        res.details.setdefault('flags', []).append('dpi_vendor_hop')
+                        res.details.setdefault('flags', []).append(f'dpi_vendor_hop:{ptr}')
             else:
                 break
     except PermissionError:
@@ -950,6 +1004,18 @@ def ttl_manipulation_check(hostname: str) -> DetectorResult:
     return res
 
 # ---------- Packet fragmentation check ----------
+def _tcp_handshake(ip_addr: str, port: int, timeout: float = 3) -> Optional[Dict]:
+    sport = random.randint(20000, 60000)
+    client_seq = random.randint(0, (1 << 32) - 1)
+    syn = scapy.TCP(dport=port, sport=sport, flags='S', seq=client_seq)
+    synack = scapy.sr1(scapy.IP(dst=ip_addr) / syn, timeout=timeout, verbose=0)
+    if not synack or not synack.haslayer(scapy.TCP) or not (synack[scapy.TCP].flags & 0x12):
+        return None
+    conn = {'sport': sport, 'seq': client_seq + 1, 'ack': synack[scapy.TCP].seq + 1}
+    ack_pkt = scapy.TCP(dport=port, sport=sport, seq=conn['seq'], ack=conn['ack'], flags='A')
+    scapy.send(scapy.IP(dst=ip_addr) / ack_pkt, verbose=0)
+    return conn
+
 def packet_fragmentation_check(hostname: str) -> DetectorResult:
     res = DetectorResult('packet_fragmentation')
     if not SCAPY_AVAILABLE:
@@ -957,17 +1023,36 @@ def packet_fragmentation_check(hostname: str) -> DetectorResult:
         return res
     try:
         ip_addr = socket.gethostbyname(hostname)
-        ip = scapy.IP(dst=ip_addr)
-        tcp = scapy.TCP(dport=80, flags='S')
-        ans, _ = scapy.sr(ip / tcp, timeout=3, verbose=0)
-        non_frag_success = bool(ans)
 
-        large_payload = b'GET / HTTP/1.1\r\nHost: ' + hostname.encode() + b'\r\n\r\n' + b'A' * 1000
-        frag_pkts = scapy.fragment(ip / scapy.TCP(dport=80, sport=random.randint(1024,65535)) / scapy.Raw(large_payload), fragsize=500)
-        frag_ans = scapy.sr(frag_pkts, timeout=3, verbose=0)
-        frag_success = bool(frag_ans)
+        # Both requests need a real completed 3-way handshake first: sending
+        # a data segment with an arbitrary seq/ack before one existed meant
+        # every response - or lack of one - reflected a malformed connection,
+        # not whether the network was blocking fragments.
+        request = (b'GET / HTTP/1.1\r\nHost: ' + hostname.encode() +
+                   b'\r\nConnection: close\r\n\r\n')
+        padded_request = (b'GET / HTTP/1.1\r\nHost: ' + hostname.encode() +
+                           b'\r\nConnection: close\r\nX-Padding: ' + b'A' * 1000 +
+                           b'\r\n\r\n')
 
-        if non_frag_success and not frag_success:
+        conn1 = _tcp_handshake(ip_addr, 80)
+        non_frag_success = False
+        if conn1:
+            datapkt = scapy.TCP(dport=80, sport=conn1['sport'], seq=conn1['seq'], ack=conn1['ack'], flags='PA')
+            resp = scapy.sr1(scapy.IP(dst=ip_addr) / datapkt / scapy.Raw(request), timeout=3, verbose=0)
+            non_frag_success = resp is not None
+
+        conn2 = _tcp_handshake(ip_addr, 80)
+        frag_success = False
+        if conn2:
+            datapkt2 = scapy.TCP(dport=80, sport=conn2['sport'], seq=conn2['seq'], ack=conn2['ack'], flags='PA')
+            full_pkt = scapy.IP(dst=ip_addr) / datapkt2 / scapy.Raw(padded_request)
+            frag_pkts = scapy.fragment(full_pkt, fragsize=500)
+            frag_ans, _ = scapy.sr(frag_pkts, timeout=3, verbose=0)
+            frag_success = bool(frag_ans)
+
+        if not conn1 or not conn2:
+            res.details['note'] = 'tcp_handshake_failed'
+        elif non_frag_success and not frag_success:
             res.suspicious = True
             res.score += 30
             res.details.setdefault('flags', []).append('fragments_blocked')
@@ -1063,8 +1148,8 @@ def asn_check(hostname: str) -> DetectorResult:
             infos.append(info)
             asn = (info.get('asn') or str(info.get('org') or '')).lower()
             host_lower = hostname.lower()
-            if any(k in host_lower for k in ('cloudflare', 'google', 'amazon', 'aws', 'akamai', 'microsoft', 'apple', 'facebook', 'fastly')):
-                if not any(provider in (info.get('org') or '').lower() for provider in ('google', 'amazon', 'aws', 'cloudflare', 'microsoft', 'facebook', 'fastly', 'akamai', 'apple')):
+            if any(k in host_lower for k in CDN_HOSTNAME_KEYWORDS):
+                if not any(provider in (info.get('org') or '').lower() for provider in CDN_HOSTNAME_KEYWORDS):
                     suspicious_asns.append({'ip': ip, 'org': info.get('org'), 'asn': info.get('asn')})
             if info.get('org') and any(x in info.get('org').lower() for x in ('residential', 'dsl', 'isp', 'telecom', 'telefonica', 'vodafone', 'comcast')):
                 suspicious_asns.append({'ip': ip, 'org': info.get('org'), 'asn': info.get('asn')})
@@ -1079,19 +1164,26 @@ def asn_check(hostname: str) -> DetectorResult:
     return res
 
 # ---------- Censorship check ----------
-def censorship_check() -> DetectorResult:
-    res = DetectorResult('censorship')
-    blocked = []
-    for site in CENSORSHIP_TEST_SITES:
+def _site_reachable(site: str, attempts: int = 2, timeout: int = 6) -> bool:
+    # A single timed-out request is common on ordinary flaky networks and
+    # shouldn't by itself count as evidence of censorship; retry once before
+    # giving up on a site.
+    for _ in range(attempts):
         try:
             if REQUESTS_AVAILABLE:
-                r = requests.get(f'https://{site}', timeout=5)
-                if r.status_code >= 400:
-                    blocked.append(site)
+                r = requests.get(f'https://{site}', timeout=timeout)
+                if r.status_code < 400:
+                    return True
             else:
                 socket.gethostbyname(site)
+                return True
         except Exception:
-            blocked.append(site)
+            continue
+    return False
+
+def censorship_check() -> DetectorResult:
+    res = DetectorResult('censorship')
+    blocked = [site for site in CENSORSHIP_TEST_SITES if not _site_reachable(site)]
     if blocked:
         res.suspicious = True
         res.score += int(40 * (len(blocked) / len(CENSORSHIP_TEST_SITES)))
@@ -1099,17 +1191,21 @@ def censorship_check() -> DetectorResult:
     return res
 
 # ---------- Aggregation & decision ----------
+def _recompute_suspicious(out: Dict) -> None:
+    total = 0
+    high_flags = 0
+    for d in out['detectors'].values():
+        total += d.get('score', 0)
+        if d.get('suspicious') and d.get('score', 0) >= 30:
+            high_flags += 1
+    out['dpi_score'] = int(total)
+    out['suspicious'] = high_flags >= 2 or total >= 70
+
 def correlate_results(site: str, detectors: List[DetectorResult]) -> Dict:
     out = {'site': site, 'timestamp': now_iso(), 'detectors': {}, 'suspicious': False, 'dpi_score': 0}
-    high_flags = 0
     for d in detectors:
         out['detectors'][d.name] = d.to_dict()
-        out['dpi_score'] += d.score
-        if d.suspicious and d.score >= 30:
-            high_flags += 1
-    if high_flags >= 2 or out['dpi_score'] >= 70:
-        out['suspicious'] = True
-    out['dpi_score'] = int(out['dpi_score'])
+    _recompute_suspicious(out)
     return out
 
 # ---------- Final conclusion ----------
@@ -1160,6 +1256,35 @@ def generate_conclusion(summary: Dict, vpn_result: Optional[DetectorResult]) -> 
     conclusion['total_sites'] = total
     conclusion['avg_score'] = round(avg_score, 2)
     return conclusion
+
+def _flag_relative_timing_outliers(sites: Dict[str, Dict]) -> None:
+    # Compares each tested site's TLS handshake time against the median of
+    # the *other sites tested in this same run* rather than a fixed constant,
+    # so the check adapts to the user's own baseline latency (mobile,
+    # satellite, distant CDN, etc.) instead of flagging everyone on a slow
+    # link. Needs at least 3 sites with valid samples to be meaningful.
+    samples = []
+    for site, out in sites.items():
+        m = out['detectors'].get('tls_timing', {}).get('details', {}).get('median_ms')
+        if m is not None:
+            samples.append((site, m))
+    if len(samples) < 3:
+        return
+
+    values = [m for _, m in samples]
+    pop_median = statistics.median(values)
+    mad = statistics.median(abs(v - pop_median) for v in values)
+    if mad == 0:
+        return
+
+    for site, m in samples:
+        modified_z = 0.6745 * (m - pop_median) / mad
+        if modified_z > 3.5:  # only flag sites slower than the rest of the batch
+            td = sites[site]['detectors']['tls_timing']
+            td['suspicious'] = True
+            td['score'] = td.get('score', 0) + 20
+            td.setdefault('details', {}).setdefault('flags', []).append('relative_timing_outlier')
+            _recompute_suspicious(sites[site])
 
 # ---------- Worker / Runner ----------
 def run_sites(sites: List[str], verbose: bool = False, quick: bool = False, workers: int = 4) -> Dict:
@@ -1228,12 +1353,16 @@ def run_sites(sites: List[str], verbose: bool = False, quick: bool = False, work
             try:
                 site, out = fut.result()
                 summary['sites'][site] = out
-                if verbose:
-                    print(json.dumps(out, indent=2))
-                else:
-                    print(f"{site}: suspicious={out['suspicious']} score={out['dpi_score']}")
             except Exception as e:
                 print('Site worker error:', e)
+
+    _flag_relative_timing_outliers(summary['sites'])
+
+    for site, out in summary['sites'].items():
+        if verbose:
+            print(json.dumps(out, indent=2))
+        else:
+            print(f"{site}: suspicious={out['suspicious']} score={out['dpi_score']}")
 
     censor_res = censorship_check()
     summary['censorship'] = censor_res.to_dict()
