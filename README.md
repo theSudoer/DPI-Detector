@@ -29,6 +29,25 @@ crashing:
 Install whichever of these you want with `pip install requests dnspython
 cryptography psutil scapy aioquic ja3python`.
 
+## Testing
+
+`test_dpi_detector.py` covers the pure scoring/matching logic (CT log
+wildcard matching, suspicious-score aggregation, relative TLS-timing
+outlier detection, IP validation) with the standard library's `unittest` —
+no network access, scapy, or extra packages required:
+
+```
+python test_dpi_detector.py
+```
+
+This doesn't cover the network-facing detectors themselves (DNS resolution,
+TLS handshakes, scapy probes) — those need to be run against real sites to
+sanity-check, e.g.:
+
+```
+python dpi_detector_improved_v2.py --sites www.cloudflare.com www.wikipedia.org --quick --output json -v
+```
+
 ## Accuracy notes / known limitations
 
 This is a heuristic tool, not a calibrated classifier — there's no

@@ -606,6 +606,13 @@ def http_header_injection(hostname: str) -> DetectorResult:
     return res
 
 # ---------- VPN detection ----------
+def _is_valid_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
 def check_vpn() -> DetectorResult:
     res = DetectorResult('vpn')
     res.details['psutil_available'] = PSUTIL_AVAILABLE
@@ -644,11 +651,7 @@ def check_vpn() -> DetectorResult:
                 # A service returning an error page or rate-limit notice (still
                 # HTTP 200) would otherwise register as a distinct "IP" and
                 # falsely trigger external_ip_mismatch below.
-                try:
-                    ipaddress.ip_address(ip)
-                except ValueError:
-                    continue
-                if ip:
+                if _is_valid_ip(ip):
                     exts.append(ip)
             except Exception:
                 continue
@@ -900,7 +903,7 @@ def ja3_ja3s_check(hostname: str, port: int = 443, timeout: int = 4) -> Detector
                 res.details.setdefault('note', f'scapy_fallback_error:{e}')
         except Exception as e:
             res.details.setdefault('note', f'scapy_wrapper_error:{e}')
-    elif not SCAPY_TLS_AVAILABLE:
+    elif SCAPY_AVAILABLE and not SCAPY_TLS_AVAILABLE:
         res.details.setdefault('error', 'scapy_layers_tls_not_importable')
     else:
         # Neither JA3python nor scapy available
